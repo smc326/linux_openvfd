@@ -424,7 +424,7 @@ static void openvfd_brightness_set(struct led_classdev *cdev,
 		return;
 }
 
-static int led_cmd_ioc = 0;
+static unsigned int led_cmd_ioc = 0;
 
 static ssize_t led_cmd_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
@@ -456,19 +456,19 @@ static ssize_t led_cmd_store(struct device *_dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
 	struct vfd_dev *dev = pdata->dev;
-	int cmd, temp;
+	unsigned int cmd, temp;
 	led_cmd_ioc = 0;
 
-	if (size < 2*sizeof(int))
+	if (size < 2*sizeof(unsigned int))
 		return -EFAULT;
-	memcpy(&cmd, buf, sizeof(int));
+	memcpy(&cmd, buf, sizeof(unsigned int));
 	if (_IOC_TYPE(cmd) != VFD_IOC_MAGIC)
 		return -ENOTTY;
 	if (_IOC_NR(cmd) >= VFD_IOC_MAXNR)
 		return -ENOTTY;
 
-	buf += sizeof(int);
-	memcpy(&temp, buf, sizeof(int));
+	buf += sizeof(unsigned int);
+	memcpy(&temp, buf, sizeof(unsigned int));
 	mutex_lock(&mutex);
 	switch (cmd) {
 		case VFD_IOC_SMODE:
@@ -486,7 +486,7 @@ static ssize_t led_cmd_store(struct device *_dev,
 			dev->status_led_mask = (u_int8)temp;
 			break;
 		case VFD_IOC_SDISPLAY_TYPE:
-			set_display_type(dev, temp);
+			set_display_type(dev, (int)temp);
 			break;
 		case VFD_IOC_SCHARS_ORDER:
 			if (size >= sizeof(dev->dtb_active.dat_index)+sizeof(int))
