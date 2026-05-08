@@ -34,6 +34,10 @@
 #include <linux/poll.h>
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
+#include <linux/workqueue.h>
+#include <linux/time64.h>
+#include <linux/rtc.h>
+#include <linux/thermal.h>
 #include "openvfd_drv.h"
 #include "controllers/controller_list.h"
 
@@ -47,6 +51,32 @@ static struct early_suspend openvfd_early_suspend;
 
 unsigned char vfd_display_auto_power = 1;
 static uint vfd_brightness = FD628_Brightness_8;
+/* 1 = 24h mode (default), 0 = 12h mode. */
+static unsigned int vfd_is_24hours = 1;
+/* UTC offset in hours, default UTC+8. Written by Tvsetting.apk.
+ * The autonomous clock uses this to convert UTC kernel time to local time.
+ * Range: -12 to +14 (covers all real-world timezones). */
+static int vfd_utc_offset = 8;
+
+/* Autonomous clock: fires every 500ms to display time when VFDService
+ * is not running. VFDService's write() sets vfd_last_write_jiffies;
+ * once 3s pass without a write(), the driver resumes autonomous display. */
+#define VFD_SERVICE_TIMEOUT_MS 3000
+static unsigned long vfd_last_write_jiffies;
+static bool vfd_colon_state;
+static struct delayed_work vfd_clock_work;
+
+/* Display mode: 0=clock, 1=date, 2=temperature, 3=carousel (default) */
+static int vfd_display_mode = 3;
+/* Carousel durations in seconds; 0 = skip that slot */
+static int vfd_carousel_clk_secs  = 10;
+static int vfd_carousel_date_secs = 6;
+static int vfd_carousel_temp_secs = 6;
+/* Date format: 0 = DD.MM, 1 = MM.DD (default) */
+static int vfd_date_format = 1;
+/* Carousel internal state */
+static int vfd_carousel_state = 0;   /* 0=clock, 1=date, 2=temp */
+static int vfd_carousel_ticks = 0;   /* 500ms ticks in current state */
 
 static struct vfd_platform_data *pdata = NULL;
 struct kp {
@@ -252,6 +282,9 @@ static ssize_t openvfd_dev_write(struct file *filp, const char __user * buf,
 	ssize_t status = 0;
 	unsigned long missing;
 	static struct vfd_display_data data;
+
+	/* Mark VFDService as active; autonomous clock yields for 3s */
+	vfd_last_write_jiffies = jiffies;
 
 	if (count == sizeof(data)) {
 		missing = copy_from_user(&data, buf, count);
@@ -553,6 +586,254 @@ static DEVICE_ATTR(led_cmd , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, led_cmd_show
 static DEVICE_ATTR(led_on , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, led_on_show , led_on_store);
 static DEVICE_ATTR(led_off , S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP, led_off_show , led_off_store);
 
+static ssize_t led_is_24hours_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n", vfd_is_24hours);
+}
+
+static ssize_t led_is_24hours_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	unsigned int val;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	vfd_is_24hours = val ? 1 : 0;
+	return size;
+}
+
+static DEVICE_ATTR(led_is_24hours, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_is_24hours_show, led_is_24hours_store);
+
+static ssize_t led_utc_offset_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vfd_utc_offset);
+}
+
+static ssize_t led_utc_offset_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	int val;
+	if (kstrtoint(buf, 10, &val))
+		return -EINVAL;
+	vfd_utc_offset = val;
+	return size;
+}
+
+static DEVICE_ATTR(led_utc_offset, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_utc_offset_show, led_utc_offset_store);
+
+/* ---- Temperature helper -------------------------------------------- */
+static int get_cpu_temp_degrees(void)
+{
+#ifdef CONFIG_THERMAL
+	struct thermal_zone_device *tz;
+	int millideg = 0;
+	tz = thermal_zone_get_zone_by_name("cpu_thermal");
+	if (!IS_ERR_OR_NULL(tz) && !thermal_zone_get_temp(tz, &millideg))
+		return millideg / 1000;
+#endif
+	return 0;
+}
+
+/* ---- led_display_mode (0=clock 1=date 2=temp 3=carousel) ----------- */
+static ssize_t led_display_mode_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vfd_display_mode);
+}
+static ssize_t led_display_mode_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	int val;
+	if (kstrtoint(buf, 10, &val) || val < 0 || val > 3)
+		return -EINVAL;
+	vfd_display_mode = val;
+	vfd_carousel_state = 0;
+	vfd_carousel_ticks = 0;
+	return size;
+}
+static DEVICE_ATTR(led_display_mode, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_display_mode_show, led_display_mode_store);
+
+/* ---- led_carousel_clk (seconds, 0=skip) ---------------------------- */
+static ssize_t led_carousel_clk_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vfd_carousel_clk_secs);
+}
+static ssize_t led_carousel_clk_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	int val;
+	if (kstrtoint(buf, 10, &val) || val < 0)
+		return -EINVAL;
+	vfd_carousel_clk_secs = val;
+	return size;
+}
+static DEVICE_ATTR(led_carousel_clk, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_carousel_clk_show, led_carousel_clk_store);
+
+/* ---- led_carousel_date (seconds, 0=skip) --------------------------- */
+static ssize_t led_carousel_date_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vfd_carousel_date_secs);
+}
+static ssize_t led_carousel_date_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	int val;
+	if (kstrtoint(buf, 10, &val) || val < 0)
+		return -EINVAL;
+	vfd_carousel_date_secs = val;
+	return size;
+}
+static DEVICE_ATTR(led_carousel_date, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_carousel_date_show, led_carousel_date_store);
+
+/* ---- led_carousel_temp (seconds, 0=skip) --------------------------- */
+static ssize_t led_carousel_temp_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vfd_carousel_temp_secs);
+}
+static ssize_t led_carousel_temp_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	int val;
+	if (kstrtoint(buf, 10, &val) || val < 0)
+		return -EINVAL;
+	vfd_carousel_temp_secs = val;
+	return size;
+}
+static DEVICE_ATTR(led_carousel_temp, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_carousel_temp_show, led_carousel_temp_store);
+
+/* ---- led_date_format (0=DD.MM, 1=MM.DD) ---------------------------- */
+static ssize_t led_date_format_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", vfd_date_format);
+}
+static ssize_t led_date_format_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	int val;
+	if (kstrtoint(buf, 10, &val) || (val != 0 && val != 1))
+		return -EINVAL;
+	vfd_date_format = val;
+	return size;
+}
+static DEVICE_ATTR(led_date_format, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,
+		led_date_format_show, led_date_format_store);
+
+/* Autonomous display workqueue function (fires every 500ms).
+ * Handles clock / date / temperature / carousel display.
+ * Yields to VFDService for VFD_SERVICE_TIMEOUT_MS after any write(). */
+static void vfd_clock_work_func(struct work_struct *work)
+{
+	struct timespec64 ts;
+	struct rtc_time tm;
+	struct vfd_display_data data;
+	time64_t local_sec;
+	int hour, active_mode;
+	int dur[3]; /* 500ms ticks per carousel slot */
+
+	if (pdata == NULL || controller == NULL)
+		goto reschedule;
+
+	/* Yield if VFDService wrote recently */
+	if (vfd_last_write_jiffies &&
+	    time_before(jiffies,
+			vfd_last_write_jiffies + msecs_to_jiffies(VFD_SERVICE_TIMEOUT_MS)))
+		goto reschedule;
+
+	ktime_get_real_ts64(&ts);
+	local_sec = ts.tv_sec + (time64_t)vfd_utc_offset * 3600;
+	rtc_time64_to_tm(local_sec, &tm);
+
+	/* Determine active display mode */
+	if (vfd_display_mode == 3) {
+		/* Carousel: advance ticks, switch slot when duration expires */
+		dur[0] = vfd_carousel_clk_secs  * 2;
+		dur[1] = vfd_carousel_date_secs * 2;
+		dur[2] = vfd_carousel_temp_secs * 2;
+
+		/* Ensure current slot is enabled */
+		if (dur[vfd_carousel_state] == 0) {
+			int i;
+			for (i = 0; i < 3; i++) {
+				if (dur[i] > 0) {
+					vfd_carousel_state = i;
+					vfd_carousel_ticks = 0;
+					break;
+				}
+			}
+		}
+		vfd_carousel_ticks++;
+		if (dur[vfd_carousel_state] > 0 &&
+		    vfd_carousel_ticks >= dur[vfd_carousel_state]) {
+			int i;
+			vfd_carousel_ticks = 0;
+			for (i = 1; i <= 3; i++) {
+				int next = (vfd_carousel_state + i) % 3;
+				if (dur[next] > 0) {
+					vfd_carousel_state = next;
+					break;
+				}
+			}
+		}
+		active_mode = vfd_carousel_state;
+	} else {
+		active_mode = vfd_display_mode;
+	}
+
+	memset(&data, 0, sizeof(data));
+
+	switch (active_mode) {
+	case 0: /* clock */
+		data.mode = DISPLAY_MODE_CLOCK;
+		data.colon_on = vfd_colon_state ? 1 : 0;
+		vfd_colon_state = !vfd_colon_state;
+		hour = tm.tm_hour;
+		if (!vfd_is_24hours) {
+			if (hour == 0)      hour = 12;
+			else if (hour > 12) hour -= 12;
+		}
+		data.time_date.hours      = (u_int8)hour;
+		data.time_date.minutes    = (u_int8)tm.tm_min;
+		data.time_date.seconds    = (u_int8)tm.tm_sec;
+		data.time_date.day_of_week = (u_int8)tm.tm_wday;
+		data.time_date.day        = (u_int8)tm.tm_mday;
+		data.time_date.month      = (u_int8)tm.tm_mon;
+		data.time_date.year       = (u_int16)(tm.tm_year + 1900);
+		break;
+	case 1: /* date */
+		data.mode = DISPLAY_MODE_DATE;
+		data.time_date.day   = (u_int8)tm.tm_mday;
+		data.time_date.month = (u_int8)tm.tm_mon;
+		/* _reserved=0: DD.MM, _reserved=1: MM.DD */
+		data.time_secondary._reserved = (u_int8)vfd_date_format;
+		break;
+	case 2: /* temperature */
+		data.mode = DISPLAY_MODE_TEMPERATURE;
+		data.temperature = get_cpu_temp_degrees();
+		break;
+	default:
+		data.mode = DISPLAY_MODE_CLOCK;
+		break;
+	}
+
+	mutex_lock(&mutex);
+	controller->write_display_data(&data);
+	mutex_unlock(&mutex);
+
+reschedule:
+	schedule_delayed_work(&vfd_clock_work, msecs_to_jiffies(500));
+}
+
 #if defined(CONFIG_HAS_EARLYSUSPEND) || defined(CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND)
 static void openvfd_suspend(struct early_suspend *h)
 {
@@ -568,15 +849,15 @@ static void openvfd_resume(struct early_suspend *h)
 #endif
 
 char *vfd_gpio_chip_name = NULL;
-unsigned int vfd_gpio_clk[3];
-unsigned int vfd_gpio_dat[3];
-unsigned int vfd_gpio_stb[3];
+unsigned int vfd_gpio_clk[3] = { 0x00, 0x00, 0x00 };
+unsigned int vfd_gpio_dat[3] = { 0x00, 0x00, 0x00 };
+unsigned int vfd_gpio_stb[3] = { 0x00, 0x00, 0xFF };
 unsigned int vfd_gpio0[3] = { 0x00, 0x00, 0xFF };
 unsigned int vfd_gpio1[3] = { 0x00, 0x00, 0xFF };
 unsigned int vfd_gpio2[3] = { 0x00, 0x00, 0xFF };
 unsigned int vfd_gpio3[3] = { 0x00, 0x00, 0xFF };
 unsigned int vfd_gpio_protocol[2] = { 0x00, 0x00 };
-unsigned int vfd_chars[7] = { 0, 1, 2, 3, 4, 5, 6 };
+unsigned int vfd_chars[7] = { 0, 0, 0, 0, 0, 0, 0 };
 unsigned int vfd_dot_bits[8] = { 0, 1, 2, 3, 4, 5, 6, 0 };
 unsigned int vfd_display_type[4] = { 0x00, 0x00, 0x00, 0x00 };
 int vfd_gpio_clk_argc = 0;
@@ -821,12 +1102,13 @@ int request_pin(const char *name, struct vfd_pin *pin, unsigned char enable_skip
 	pin->flags.bits.is_requested = 0;
 	if (!enable_skip || pin->pin != -2) {
 		ret = -1;
-		if (pin->pin >= 0)
+		if (pin->pin >= 0) {
 			ret = gpio_request(pin->pin, DEV_NAME);
-		if (!ret)
-			pin->flags.bits.is_requested = 1;
-		else
-			pr_error("can't request gpio of %s", name);
+			if (ret)
+				pr_error("can't request gpio of %s (ignored, ret=%d)", name, ret);
+			ret = 0; /* continue anyway, gpio ops may still work */
+		}
+		pin->flags.bits.is_requested = 1;
 	}
 	return ret;
 }
@@ -923,7 +1205,8 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 		memset(&pdata->dev->dtb_active.display, 0, sizeof(struct vfd_display));
 		display_type_prop = of_find_property(pdev->dev.of_node, MOD_NAME_TYPE, NULL);
 		if (display_type_prop && display_type_prop->value)
-			of_property_read_u32(pdev->dev.of_node, MOD_NAME_TYPE, (int*)&pdata->dev->dtb_active.display);
+			of_property_read_u8_array(pdev->dev.of_node, MOD_NAME_TYPE,
+				(u8*)&pdata->dev->dtb_active.display, sizeof(struct vfd_display));
 		pr_dbg2("display.type = %d, display.controller = %d, pdata->dev->dtb_active.display.flags = 0x%02X\n",
 			pdata->dev->dtb_active.display.type, pdata->dev->dtb_active.display.controller, pdata->dev->dtb_active.display.flags);
 	}
@@ -968,6 +1251,15 @@ static int openvfd_driver_probe(struct platform_device *pdev)
 	device_create_file(kp->cdev.dev, &dev_attr_led_on);
 	device_create_file(kp->cdev.dev, &dev_attr_led_off);
 	device_create_file(kp->cdev.dev, &dev_attr_led_cmd);
+	device_create_file(kp->cdev.dev, &dev_attr_led_is_24hours);
+	device_create_file(kp->cdev.dev, &dev_attr_led_utc_offset);
+	device_create_file(kp->cdev.dev, &dev_attr_led_display_mode);
+	device_create_file(kp->cdev.dev, &dev_attr_led_carousel_clk);
+	device_create_file(kp->cdev.dev, &dev_attr_led_carousel_date);
+	device_create_file(kp->cdev.dev, &dev_attr_led_carousel_temp);
+	device_create_file(kp->cdev.dev, &dev_attr_led_date_format);
+	INIT_DELAYED_WORK(&vfd_clock_work, vfd_clock_work_func);
+	schedule_delayed_work(&vfd_clock_work, msecs_to_jiffies(1000));
 	init_controller(pdata->dev);
 #if 0
 	// TODO: Display 'boot' during POST/boot.
@@ -1030,6 +1322,7 @@ static int openvfd_driver_remove(struct platform_device *pdev)
 #endif
 {
 	set_power(0);
+	cancel_delayed_work_sync(&vfd_clock_work);
 #if defined(CONFIG_HAS_EARLYSUSPEND) || defined(CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND)
 	unregister_early_suspend(&openvfd_early_suspend);
 #endif

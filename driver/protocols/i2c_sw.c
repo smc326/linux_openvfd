@@ -91,16 +91,27 @@ struct protocol_interface *init_sw_i2c(unsigned short _address, unsigned char _l
 	return i2c_sw_ptr;
 }
 
+static int gpio_errors_logged = 0;
+
 static inline void gpio_set_pin_low(const struct vfd_pin *pin)
 {
-	gpio_direction_output(pin->pin, LOW);
+	int ret = gpio_direction_output(pin->pin, LOW);
+	if (ret && !gpio_errors_logged) {
+		gpio_errors_logged = 1;
+		pr_dbg2("gpio_direction_output(%d, LOW) failed: %d\n", pin->pin, ret);
+	}
 }
 
 static inline void gpio_set_pin_high(const struct vfd_pin *pin)
 {
-	if (pin->flags.bits.kick_high)
-		gpio_direction_output(pin->pin, HIGH);
-	gpio_direction_input(pin->pin);
+	/* Use push-pull output HIGH instead of open-drain (direction_input).
+	 * FD650 ACK is not checked (clk_stretch_timeout=0), so no need for
+	 * true open-drain. This avoids floating lines when no pull-up is present. */
+	int ret = gpio_direction_output(pin->pin, HIGH);
+	if (ret && !gpio_errors_logged) {
+		gpio_errors_logged = 1;
+		pr_dbg2("gpio_direction_output(%d, HIGH) failed: %d\n", pin->pin, ret);
+	}
 }
 
 static void i2c_sw_start_condition(void)

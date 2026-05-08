@@ -15,7 +15,7 @@
 
 #define UNUSED(x)	(void*)(x)
 #define DRV_NAME	"/dev/" DEV_NAME
-#define PIPE_PATH	"/tmp/" DEV_NAME "_service"
+#define PIPE_PATH	"/data/local/tmp/" DEV_NAME "_service"
 
 void select_display_type(void);
 bool set_display_type(int new_display_type);
@@ -121,6 +121,78 @@ int get_cpu_temp(void)
 	return temp / 1000;
 }
 
+/* Shared 12h/24h state, updated by settings_watcher_thread */
+static volatile bool g_is_12h = false;
+
+/* Apply Android timezone from system property.
+ * Uses 'date +%z' to get UTC offset from Android shell (which knows the
+ * correct timezone), then constructs a POSIX TZ string like "UTC-8".
+ * This avoids dependency on individual zoneinfo files (Android uses tzdata). */
+static void apply_android_timezone(void)
+{
+	/* Get UTC offset from Android shell (e.g. "+0800") */
+	FILE *fp = popen("date +%z 2>/dev/null", "r");
+	if (!fp) return;
+	char offset[16] = {0};
+	if (fgets(offset, sizeof(offset), fp)) {
+		int len = (int)strlen(offset);
+		while (len > 0 && (offset[len-1] == '\n' || offset[len-1] == '\r' || offset[len-1] == ' '))
+			offset[--len] = '\0';
+		/* Expect format: +HHMM or -HHMM */
+		if (len == 5 && (offset[0] == '+' || offset[0] == '-')) {
+			int sign  = (offset[0] == '+') ? 1 : -1;
+			int hours = (offset[1]-'0')*10 + (offset[2]-'0');
+			int mins  = (offset[3]-'0')*10 + (offset[4]-'0');
+			/* POSIX TZ offset is hours WEST of UTC (opposite sign).
+			 * UTC+8 → "UTC-8", UTC-5 → "UTC+5" */
+			char tz_posix[32];
+			if (mins == 0)
+				snprintf(tz_posix, sizeof(tz_posix), "UTC%+d", -sign * hours);
+			else
+				snprintf(tz_posix, sizeof(tz_posix), "UTC%+d:%02d", -sign * hours, mins);
+			setenv("TZ", tz_posix, 1);
+			tzset();
+			printf("Timezone set to: %s (offset %s)\n", tz_posix, offset);
+		}
+	}
+	pclose(fp);
+}
+
+/* Read Android time_12_24 system setting.
+ * Returns true for 12h mode, false for 24h mode.
+ * Priority: 1) sysfs node (fast, no framework needed)
+ *           2) settings_system.xml direct read
+ *           3) popen fallback */
+#define SYSFS_24H_PATH "/sys/class/leds/openvfd/led_is_24hours"
+
+/* Read 12h/24h mode from sysfs node written by Tvsetting.apk.
+ * sysfs stores 1=24h, 0=12h; returns true for 12h mode. */
+static bool get_12h_from_sysfs(void)
+{
+	char buf[8] = {0};
+	FILE *fp = fopen(SYSFS_24H_PATH, "r");
+	if (!fp) return false; /* default 24h if node not available */
+	fgets(buf, sizeof(buf), fp);
+	fclose(fp);
+	return (buf[0] == '0');
+}
+
+/* Periodic watcher thread: updates timezone every 60s and reads
+ * 12/24h mode from sysfs (written externally by Tvsetting.apk). */
+#define TIMEZONE_POLL_SECS 60
+static void *settings_watcher_thread(void *arg)
+{
+	(void)arg;
+	printf("Polling timezone every %ds, 12h/24h from %s\n",
+		TIMEZONE_POLL_SECS, SYSFS_24H_PATH);
+	while (1) {
+		sleep(TIMEZONE_POLL_SECS);
+		apply_android_timezone();
+		g_is_12h = get_12h_from_sysfs();
+	}
+	return NULL;
+}
+
 void led_display_loop(const struct display_setup *setup)
 {
 	static struct vfd_display_data data = { 0 };
@@ -221,7 +293,7 @@ void led_display_loop(const struct display_setup *setup)
 							if (setup->carousel_durations[carousel_state] > 0) {
 								if (carousel_state == 0) {
 								data.mode = DISPLAY_MODE_CLOCK;
-								if (setup->is_12h) {
+								if (g_is_12h) {
 									if (timenow->tm_hour == 0)
 										data.time_date.hours = 12;
 									else if (timenow->tm_hour > 12)
@@ -248,7 +320,7 @@ void led_display_loop(const struct display_setup *setup)
 						} else {
 							if (data.mode != DISPLAY_MODE_DATE)
 								data.mode = DISPLAY_MODE_CLOCK;
-							if (setup->is_12h) {
+							if (g_is_12h) {
 								if (timenow->tm_hour == 0)
 									data.time_date.hours = 12;
 								else if (timenow->tm_hour > 12)
@@ -531,6 +603,9 @@ int main(int argc, char *argv[])
 	bool cycle_display_types = true;
 	pthread_t disp_id, npipe_id = 0;
 
+		/* Apply Android timezone */
+	apply_android_timezone();
+
 	if (print_usage(argc, argv))
 		return 0;
 	openvfd_fd = open(DRV_NAME, O_RDWR);
@@ -540,6 +615,13 @@ int main(int argc, char *argv[])
 	}
 
 	verbose = is_verbose(argc, argv);
+	/* Read initial 12h/24h state from sysfs (written by Tvsetting.apk) */
+	g_is_12h = get_12h_from_sysfs();
+	{
+		pthread_t watcher_id;
+		pthread_create(&watcher_id, NULL, settings_watcher_thread, NULL);
+		pthread_detach(watcher_id);
+	}
 	char_order_count = get_cmd_chars_order(argc, argv, char_indexes, (int)sizeof(char_indexes));
 	if (char_order_count)
 		if (ioctl(openvfd_fd, VFD_IOC_SCHARS_ORDER, char_indexes))
