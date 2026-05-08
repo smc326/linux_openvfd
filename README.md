@@ -2,6 +2,10 @@
 
 [English](#english) | [中文](#中文)
 
+> **Branch: `s922x-dev`** — Amlogic S922X / G12B adaptation.
+> Adds kernel-autonomous clock/date/temperature display, new sysfs control nodes,
+> Android timezone sync in VFDService, and S922X (Tanix Q7) hardware configuration.
+
 ---
 
 ## English
@@ -10,6 +14,7 @@ This repository contains the Linux kernel driver and userspace service for FD628
 
 - [FD628 / PT6964 Controller Datasheet](http://pdf1.alldatasheet.com/datasheet-pdf/view/232882/PTC/PT6964.html)
 - Driver version: **V1.4.4**
+- Target platform: **Amlogic S922X / G12B** (Android TV, ARMv7-a kernel module)
 
 ### Supported Controllers
 
@@ -50,6 +55,49 @@ This repository contains the Linux kernel driver and userspace service for FD628
 - **CHANNEL** — Channel number
 - **TITLE** — Scrolling text string
 - **PLAYBACK_TIME** — Media playback time (MM:SS or HH:MM)
+
+### Kernel-Autonomous Display (New in s922x-dev)
+
+The driver contains an internal 500 ms delayed work queue (`vfd_clock_work`) that
+**automatically drives the display without VFDService**.
+
+- When VFDService has not written to `/dev/openvfd` for **3 seconds**, the driver
+  takes over and displays clock / date / temperature according to the sysfs settings.
+- When VFDService is active (writes within 3 s), the driver yields control.
+
+#### sysfs Control Nodes
+
+All nodes are under `/sys/class/leds/openvfd/`:
+
+| Node | R/W | Default | Description |
+|------|-----|---------|-------------|
+| `led_is_24hours` | R/W | `1` | Time format: `1`=24h, `0`=12h. Written by TvSettings.apk |
+| `led_utc_offset` | R/W | `8` | UTC offset in hours (−12 to +14). Used by autonomous clock |
+| `led_display_mode` | R/W | `3` | `0`=clock, `1`=date, `2`=temperature, `3`=carousel |
+| `led_carousel_clk` | R/W | `10` | Clock slot duration (seconds). `0` = skip |
+| `led_carousel_date` | R/W | `6` | Date slot duration (seconds). `0` = skip |
+| `led_carousel_temp` | R/W | `6` | Temperature slot duration (seconds). `0` = skip |
+| `led_date_format` | R/W | `1` | `0`=DD.MM, `1`=MM.DD |
+| `led_on` / `led_off` | W | — | Turn on/off an icon LED by name |
+| `led_cmd` | R/W | — | Generic ioctl bridge (mode, brightness, version, display type) |
+| `brightness` | R/W | `7` | Display brightness (1–8, LED class standard) |
+
+**Quick examples:**
+```bash
+# Set display to carousel mode (clock 15s → date 8s → temp 8s)
+echo 3  > /sys/class/leds/openvfd/led_display_mode
+echo 15 > /sys/class/leds/openvfd/led_carousel_clk
+echo 8  > /sys/class/leds/openvfd/led_carousel_date
+echo 8  > /sys/class/leds/openvfd/led_carousel_temp
+
+# Set timezone to UTC+8 and switch to 24-hour format
+echo 8 > /sys/class/leds/openvfd/led_utc_offset
+echo 1 > /sys/class/leds/openvfd/led_is_24hours
+
+# Show date only (MM.DD format)
+echo 1 > /sys/class/leds/openvfd/led_display_mode
+echo 1 > /sys/class/leds/openvfd/led_date_format
+```
 
 ### OpenVFDService — Userspace Daemon
 
@@ -100,12 +148,45 @@ Key options:
 ### Building the Kernel Module
 
 ```bash
-# Cross-compile for arm64
+# Cross-compile for Amlogic G12B (ARMv7-a hard-float)
 cd driver
+make KERNELDIR=/root/kernel-g12b \
+     KCFLAGS='-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard'
+
+# Generic arm64 cross-compile
 make KERNELDIR=/path/to/kernel/source
 
-# Or native compile (on target board)
+# Native compile on target board
 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+```
+
+### S922X / Tanix Q7 Hardware Configuration
+
+Device tree node (`openvfd` in DTS):
+
+```dts
+openvfd {
+    dev_name = "openvfd";
+    status = "okay";
+    openvfd_gpio_clk  = <0 50 0>;   /* SCL — GPIO_AO bank 50 */
+    openvfd_gpio_dat  = <0 51 0>;   /* SDA — GPIO_AO bank 51 */
+    openvfd_gpio_stb  = <0  0 255>; /* FD650 I²C mode: STB unused */
+    openvfd_chars     = [00 04 03 02 01];
+    openvfd_dot_bits  = [00 01 02 03 04 05 06];
+    openvfd_display_type = <0x05 0x00 0x00 0x03>; /* 4D_7S_COL, FD650 */
+};
+```
+
+Equivalent `insmod` parameters:
+
+```bash
+insmod /vendor/lib/modules/openvfd.ko \
+  vfd_gpio_clk=0,50,0 \
+  vfd_gpio_dat=0,51,0 \
+  vfd_gpio_stb=0,0,255 \
+  vfd_chars=0,4,3,2,1 \
+  vfd_dot_bits=0,1,2,3,4,5,6 \
+  vfd_display_type=5,0,0,3
 ```
 
 ### Configuration — vfd.conf
@@ -135,6 +216,7 @@ vfd_display_type='0x01,0x00,0x00,0x00'  # type,reserved,flags,controller
 
 - [FD628 / PT6964 控制器数据手册](http://pdf1.alldatasheet.com/datasheet-pdf/view/232882/PTC/PT6964.html)
 - 驱动版本：**V1.4.4**
+- 目标平台：**Amlogic S922X / G12B**（Android TV，ARMv7-a 内核模块）
 
 ### 支持的控制器
 
@@ -175,6 +257,47 @@ vfd_display_type='0x01,0x00,0x00,0x00'  # type,reserved,flags,controller
 - **频道（CHANNEL）** — 显示频道号
 - **标题（TITLE）** — 显示自定义文字
 - **播放时间（PLAYBACK_TIME）** — 显示媒体播放进度（MM:SS 或 HH:MM）
+
+### 内核自主显示（s922x-dev 新增）
+
+驱动内置 500 ms 延迟工作队列（`vfd_clock_work`），**无需 VFDService 也能独立驱动显示屏**。
+
+- VFDService **3 秒内无写入** → 驱动自动接管，按 sysfs 配置显示时钟/日期/温度
+- VFDService **正常运行时** → 驱动让出控制权，不干预显示内容
+
+#### sysfs 控制节点
+
+节点路径：`/sys/class/leds/openvfd/`
+
+| 节点 | 读/写 | 默认值 | 说明 |
+|------|-------|--------|------|
+| `led_is_24hours` | 读写 | `1` | 时制：`1`=24小时制，`0`=12小时制。由 TvSettings.apk 写入 |
+| `led_utc_offset` | 读写 | `8` | UTC 时区偏移（小时，−12 到 +14）。内核自主时钟使用此值换算本地时间 |
+| `led_display_mode` | 读写 | `3` | `0`=时钟，`1`=日期，`2`=温度，`3`=轮播 |
+| `led_carousel_clk` | 读写 | `10` | 轮播：时钟显示时长（秒），`0`=跳过 |
+| `led_carousel_date` | 读写 | `6` | 轮播：日期显示时长（秒），`0`=跳过 |
+| `led_carousel_temp` | 读写 | `6` | 轮播：温度显示时长（秒），`0`=跳过 |
+| `led_date_format` | 读写 | `1` | 日期格式：`0`=DD.MM，`1`=MM.DD |
+| `led_on` / `led_off` | 写 | — | 按名称点亮/熄灭图标 LED |
+| `led_cmd` | 读写 | — | 通用 ioctl 通道（模式/亮度/版本/显示类型）|
+| `brightness` | 读写 | `7` | 显示亮度（1–8 级，LED 类设备标准接口）|
+
+**快速示例：**
+```bash
+# 设置为轮播模式（时钟 15s → 日期 8s → 温度 8s）
+echo 3  > /sys/class/leds/openvfd/led_display_mode
+echo 15 > /sys/class/leds/openvfd/led_carousel_clk
+echo 8  > /sys/class/leds/openvfd/led_carousel_date
+echo 8  > /sys/class/leds/openvfd/led_carousel_temp
+
+# 设置时区 UTC+8，开启 24 小时制
+echo 8 > /sys/class/leds/openvfd/led_utc_offset
+echo 1 > /sys/class/leds/openvfd/led_is_24hours
+
+# 仅显示日期（MM.DD 格式）
+echo 1 > /sys/class/leds/openvfd/led_display_mode
+echo 1 > /sys/class/leds/openvfd/led_date_format
+```
 
 ### OpenVFDService — 用户态显示守护进程
 
@@ -227,12 +350,45 @@ fnnas-openvfd
 ### 编译内核模块
 
 ```bash
-# 交叉编译（目标架构 arm64）
+# Amlogic G12B 交叉编译（ARMv7-a hard-float）
 cd driver
+make KERNELDIR=/root/kernel-g12b \
+     KCFLAGS='-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard'
+
+# 通用 arm64 交叉编译
 make KERNELDIR=/path/to/kernel/source
 
 # 在目标板上本地编译
 make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+```
+
+### S922X / Tanix Q7 硬件配置
+
+设备树节点（DTS）：
+
+```dts
+openvfd {
+    dev_name = "openvfd";
+    status = "okay";
+    openvfd_gpio_clk  = <0 50 0>;   /* SCL — GPIO_AO bank 50 */
+    openvfd_gpio_dat  = <0 51 0>;   /* SDA — GPIO_AO bank 51 */
+    openvfd_gpio_stb  = <0  0 255>; /* FD650 I²C 模式：STB 不使用 */
+    openvfd_chars     = [00 04 03 02 01];
+    openvfd_dot_bits  = [00 01 02 03 04 05 06];
+    openvfd_display_type = <0x05 0x00 0x00 0x03>; /* 4D_7S_COL + FD650 */
+};
+```
+
+等效的 `insmod` 参数写法：
+
+```bash
+insmod /vendor/lib/modules/openvfd.ko \
+  vfd_gpio_clk=0,50,0 \
+  vfd_gpio_dat=0,51,0 \
+  vfd_gpio_stb=0,0,255 \
+  vfd_chars=0,4,3,2,1 \
+  vfd_dot_bits=0,1,2,3,4,5,6 \
+  vfd_display_type=5,0,0,3
 ```
 
 ### 配置文件 — vfd.conf
